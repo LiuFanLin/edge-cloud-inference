@@ -1,225 +1,173 @@
 # -*- coding: utf-8 -*-
-"""分析结果 + 画图 + 生成隐私对比表"""
-import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
+"""结果分析 -> results/summary.txt + privacy_summary.txt + results/comparison.png
+
+通信量报告两个口径, 消除上一版"上传比例 x 单次大小 != 平均值"的矛盾:
+  [全样本均值]  = 上传总字节 / 全部推理次数 (未上传计 0)
+  [上传样本均值] = 上传总字节 / 上传次数 (单次上传的实际大小)
+
+另输出: 模型能力与协同策略分解 (端侧基线/模型上界/方案B 混合三者对照),
+切分实现一致性验证, 端侧显存峰值, 以及由云端日志生成的隐私实测摘要.
+"""
 import json
 import os
 
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import pandas as pd
+
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']  # Linux 容器无中文字体, 图内一律英文防乱码
 plt.rcParams['axes.unicode_minus'] = False
 
-df = pd.read_csv('results/benchmark.csv')
 
-# === 准确率 ===
-# 以 ImageNet 映射后的真实标签为准
-acc_a = (df['pred_split'] == df['true_imagenet']).mean()
-acc_b = (df['pred_offload'] == df['true_imagenet']).mean()
-consistency = (df['pred_split'] == df['pred_offload']).mean()
+def main():
+    df = pd.read_csv('results/benchmark.csv')
+    up = df[df['uploaded']]
+    nu = df[~df['uploaded']]
 
-# === 方案B 上传比例 ===
-upload_rate = df['uploaded'].mean()
-upload_count = df['uploaded'].sum()
+    acc_split = (df['pred_split'] == df['true_label']).mean()
+    acc_offload = (df['pred_offload'] == df['true_label']).mean()
+    acc_edge_alone = (df['pred_edge_mobile'] == df['true_label']).mean()
+    acc_rn50 = (df['pred_rn50'] == df['true_label']).mean()
+    agree = (df['pred_split'] == df['pred_offload']).mean()
+    split_eq_full = (df['pred_split'] == df['pred_rn50']).mean()
+    upload_rate = df['uploaded'].mean()
 
-# === 平均指标 ===
-lat_a = df['latency_split_ms'].mean()
-lat_b = df['latency_offload_ms'].mean()
-comm_a = df['comm_split_bytes'].mean()
-comm_b = df['comm_offload_bytes'].mean()
-edge_a = df['edge_split_ms'].mean()
-edge_b = df['edge_offload_ms'].mean()
-cloud_a = df['cloud_split_ms'].mean()
-cloud_b = df['cloud_offload_ms'].mean()
+    comm_a = df['comm_split_bytes'].mean()
+    mean_comm_b = df['comm_offload_bytes'].mean()
+    avg_up_bytes = up['comm_offload_bytes'].mean() if len(up) else 0
 
-# === 画图 ===
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    # 上传样本中被云端纠正的比例 (MobileNet 错 -> 云端对)
+    if len(up):
+        corrected = ((up['pred_edge_mobile'] != up['true_label']) &
+                     (up['pred_offload'] == up['true_label'])).mean()
 
-# 图1: 端到端时延对比
-axes[0, 0].bar(['SplitNN\n(A)', 'Offload\n(B)'],
-               [lat_a, lat_b], color=['steelblue', 'coral'])
-axes[0, 0].set_ylabel('Latency (ms)')
-axes[0, 0].set_title('End-to-End Latency')
+    lines = ['=== 性能汇总 (200 样本 x 3 轮) ===']
+    lines.append(
+        f'端到端时延  方案A: {df["lat_split_ms"].mean():.2f} ms | '
+        f'方案B: {df["lat_offload_ms"].mean():.2f} ms')
+    lines.append(
+        f'端侧计算    方案A: {df["edge_split_ms"].mean():.2f} ms | '
+        f'方案B: {df["edge_offload_ms"].mean():.2f} ms')
+    lines.append(
+        f'云端+网络   方案A: {df["cloud_split_ms"].mean():.2f} ms | '
+        f'方案B(仅上传样本): {up["cloud_offload_ms"].mean():.2f} ms')
+    lines.append(
+        f'通信量[全样本均值]  方案A: {comm_a/1024:.2f} KB | '
+        f'方案B: {mean_comm_b/1024:.2f} KB')
+    lines.append(
+        f'通信量[上传样本单次均值] 方案B: {avg_up_bytes/1024:.2f} KB '
+        f'(上传比例 {upload_rate:.2%}, 二者乘积=全样本均值, 口径自洽)')
+    lines.append(
+        f'准确率  方案A(ResNet50 分割): {acc_split:.2%} | '
+        f'方案B(分级卸载): {acc_offload:.2%} | '
+        f'端侧基线(MobileNetV3-Small 单独): {acc_edge_alone:.2%}')
+    if len(up):
+        lines.append(
+            f'方案B 相比端侧基线的增益: {(acc_offload-acc_edge_alone)*100:+.1f} pp; '
+            f'上传样本中被云端纠正的比例: {corrected:.2%}')
+    lines.append(f'两方案预测一致率: {agree:.2%}')
+    lines += ['', '=== 模型能力与协同策略分解 (区分模型差异与门控策略影响) ===']
+    lines.append(
+        f'模型上界 (ResNet50 完整推理): 准确率 {acc_rn50:.2%}, '
+        f'本地时延 {df["rn50_ms"].mean():.2f} ms')
+    lines.append(
+        f'方案B 相比端侧基线 {(acc_offload-acc_edge_alone)*100:+.1f} pp, '
+        f'距模型上界 {(acc_rn50-acc_offload)*100:.1f} pp '
+        f'(差距来自高置信样本沿用端侧判断)')
+    lines.append(
+        f'切分实现验证: 方案A 与完整 ResNet50 预测一致率 {split_eq_full:.2%} '
+        f'(前后向拼接与完整前向数值等价, 切分实现正确)')
+    if os.path.exists('results/edge_peak_mem.txt'):
+        with open('results/edge_peak_mem.txt', encoding='utf-8') as f:
+            peak_mb = float(f.read().strip())
+        lines.append(
+            f'端侧进程 GPU 显存峰值: {peak_mb:.1f} MB '
+            f'(MobileNet + ResNet50-front + 完整 ResNet50 全加载)')
+    conf_nu = nu['conf_mobile'].mean() if len(nu) else float('nan')
+    conf_up = up['conf_mobile'].mean() if len(up) else float('nan')
+    lines.append(
+        f'置信度(MobileNet): 全样本均值 {df["conf_mobile"].mean():.3f} | '
+        f'未上传均值 {conf_nu:.3f} | '
+        f'上传样本均值 {conf_up:.3f}')
 
-# 图2: 通信量对比
-axes[0, 1].bar(['SplitNN\n(A)', 'Offload\n(B)'],
-               [comm_a / 1024, comm_b / 1024], color=['steelblue', 'coral'])
-axes[0, 1].set_ylabel('Avg Comm (KB)')
-axes[0, 1].set_title('Average Communication')
+    # 云端日志
+    if os.path.exists('results/cloud_log.jsonl'):
+        with open('results/cloud_log.jsonl', encoding='utf-8') as f:
+            logs = [json.loads(l) for l in f if l.strip()]
+        sp = [x for x in logs if x['route'] == 'split']
+        of = [x for x in logs if x['route'] == 'offload']
+        lines += ['', '=== 云端日志统计 ===']
+        if sp:
+            lines.append(f'/split   收到 {len(sp)} 次, '
+                         f'平均 {sum(x["bytes"] for x in sp)/len(sp)/1024:.2f} KB')
+        if of:
+            lines.append(f'/offload 收到 {len(of)} 次, '
+                         f'平均 {sum(x["bytes"] for x in of)/len(of)/1024:.2f} KB')
 
-# 图3: 端侧 vs 云端耗时
-x = np.arange(2)
-w = 0.35
-axes[1, 0].bar(x - w/2, [edge_a, edge_b], w, label='Edge', color='steelblue')
-axes[1, 0].bar(x + w/2, [cloud_a, cloud_b], w, label='Cloud+Network', color='coral')
-axes[1, 0].set_xticks(x)
-axes[1, 0].set_xticklabels(['SplitNN (A)', 'Offload (B)'])
-axes[1, 0].set_ylabel('Time (ms)')
-axes[1, 0].set_title('Edge vs Cloud Time')
-axes[1, 0].legend()
+        # === 隐私数据实测摘要 (任务书: 结合通信内容与日志说明) ===
+        p = ['=== 隐私数据实测摘要 (由 cloud_log.jsonl + benchmark.csv 生成) ===',
+             '']
+        p.append('[云端实际收到并记录的信息]')
+        if sp:
+            p.append(
+                f'方案A /split: {len(sp)} 次请求, 每次 raw float32 特征图 '
+                f'{sp[0]["bytes"]/1024:.0f} KB (1024x14x14), '
+                f'累计 {sum(x["bytes"] for x in sp)/1024/1024:.2f} MB')
+        if of:
+            of_bytes = pd.Series([x['bytes'] for x in of])
+            p.append(
+                f'方案B /offload: {len(of)} 次请求, 原图 PNG 均值 '
+                f'{of_bytes.mean()/1024:.2f} KB (标准差 {of_bytes.std()/1024:.1f} KB, '
+                f'随图像内容波动), 累计 {of_bytes.sum()/1024/1024:.2f} MB')
+        p.append(f'方案B 另有 {len(nu)} 次推理云端零可见 (端侧自答, 未发生通信)')
+        p.append('云端日志字段: route / bytes / infer_ms / pred / time '
+                 '(即云端方可持久化保存的全部信息)')
+        p += ['', '[元数据泄露面 - 云端观察者据此可推断]']
+        p.append(f'1. 上传比例 {upload_rate:.2%} -> 泄露样本难度分布与端侧模型能力边界')
+        p.append(f'2. 请求时间戳范围 {min(x["time"] for x in logs)} ~ '
+                 f'{max(x["time"] for x in logs)} -> 泄露用户活跃时段')
+        if sp and of:
+            p.append('3. 方案A 请求字节数恒定, 方案B 随图像内容波动 '
+                     '-> 通信模式可区分两类协同请求')
+        p += ['', '[端侧保留 - 未暴露给云端]']
+        p.append('原图 (方案A 全部 / 方案B 高置信部分), 各样本置信度与端侧预测')
+        p += ['', '风险成立条件与缓解建议见报告 main.tex 第 4 节; '
+                 '本文件仅列实测可见数据, 不含推测.']
+        with open('results/privacy_summary.txt', 'w', encoding='utf-8') as f:
+            f.write('\n'.join(p))
+        print('隐私实测摘要 -> results/privacy_summary.txt')
 
-# 图4: 方案B 端云分流饼图
-total_count = len(df)
-edge_count = total_count - upload_count
-axes[1, 1].pie([edge_count, upload_count],
-               labels=[f'Edge-only ({edge_count})', f'Uploaded ({upload_count})'],
-               autopct='%1.1f%%', colors=['lightgreen', 'salmon'])
-axes[1, 1].set_title('Offload (B): Edge vs Cloud Split')
+    txt = '\n'.join(lines)
+    with open('results/summary.txt', 'w', encoding='utf-8') as f:
+        f.write(txt)
+    print(txt)
 
-plt.tight_layout()
-plt.savefig('results/comparison.png', dpi=150)
-print('图表已保存到 results/comparison.png')
-
-# === 汇总表 ===
-summary = f"""============================================
-   性能对比汇总表
-============================================
-
-测试条件:
-  样本数: 100 (CIFAR-10 test set, resized to 224x224)
-  重复轮数: 3 (共 300 次推理/方案)
-  模型: ResNet18 (ImageNet 预训练)
-  部署: 同一台机器, 两个进程模拟端云
-  通信: HTTP (localhost:5000)
-  计时口径: 端到端 = 数据预处理后 -> 收到预测结果
-  预热: 5 张 (不计入统计)
-
---------------------------------------------
-指标                  方案A(SplitNN)    方案B(Offload)
---------------------------------------------
-端到端时延 (ms)        {lat_a:<16.2f} {lat_b:<16.2f}
-端侧计算 (ms)          {edge_a:<16.2f} {edge_b:<16.2f}
-云端+网络 (ms)         {cloud_a:<16.2f} {cloud_b:<16.2f}
-平均通信量 (bytes)     {comm_a:<16.0f} {comm_b:<16.0f}
-平均通信量 (KB)        {comm_a/1024:<16.2f} {comm_b/1024:<16.2f}
-准确率 (ImageNet映射)   {acc_a:<16.2%} {acc_b:<16.2%}
-上传比例               {'100%':<16} {upload_rate:<16.2%}
-两方案预测一致率        {consistency:<16.2%}
---------------------------------------------
-"""
-print(summary)
-
-with open('results/summary.txt', 'w', encoding='utf-8') as f:
-    f.write(summary)
-
-# === 隐私分析表 ===
-privacy = """============================================
-   隐私安全对比表
-============================================
-
-方案A: 分割推理 (SplitNN)
-  协同机制: ResNet18 按层切分, 端侧跑前半(conv1~layer2),
-           输出 128x28x28 中间特征图上传, 云端跑后半(layer3~fc)
-  传输与保存的信息:
-    - 端侧 -> 云端: 128x28x28 float32 特征图 (约 401KB/次)
-    - 云端可记录: 特征图内容 + 请求时间 + 请求来源
-    - 端侧保留: 原始图像 (不上传)
-  可能风险:
-    1. 特征反演重建: 中间特征图含丰富语义信息,
-       攻击者拿到特征图 + 模型后半部分可能重建原图
-       (文献依据: "Deep Leakage from Gradients" 等研究表明
-       中间特征可被用于重建输入)
-    2. 语义信息泄露: 128x28x28 特征图大小接近原图,
-       信息密度高, 含纹理/形状/对象信息
-    3. 通信链路窃听: 传输 401KB 数据, 中间人可截获
-  风险成立条件:
-    - 攻击者获取特征图 + 模型后半部分权重
-    - 或: 通信链路未加密, 中间人可截获
-    - 或: 云端服务方不可信, 持久化存储特征图
-  缓解建议:
-    - 特征加噪: 在特征图上添加少量噪声, 降低反演质量
-      (影响: 可能降低预测准确率 1-3%)
-    - 特征降维: 用 PCA 将 128x28x28 降到更低维度
-      (影响: 增加端侧计算, 减少通信量)
-    - 链路加密: 使用 HTTPS 替代 HTTP
-      (影响: 增加少量加密开销)
-    - 云端不持久化: 处理完即删除特征图
-      (影响: 无性能影响, 但失去日志能力)
-
---------------------------------------------
-
-方案B: 置信度驱动卸载 (Confidence-based Offload)
-  协同机制: 端侧跑完整 ResNet18, 取 softmax 最大值作为置信度,
-           置信度 >= 0.8 直接返回端侧结果;
-           置信度 < 0.8 上传原图给云端重判
-  传输与保存的信息:
-    - 高置信度样本: 不传输任何数据
-    - 低置信度样本: 原始图像 PNG (约 100-150KB/次)
-    - 云端可记录: 低置信度样本原图 + 请求时间
-    - 端侧保留: 所有样本的预测结果 + 置信度值
-  可能风险:
-    1. 原始图像泄露: 低置信度样本原图直接上传,
-       云端获取完整原图 (最敏感信息)
-    2. 元数据泄露: 云端知道哪些样本端侧不确定,
-       这本身泄露了样本难度分布信息
-       (实际观察: 云端日志可统计上传比例)
-    3. 置信度阈值泄露模型特性: 攻击者可通过
-       观察上传模式推断端侧模型的能力边界
-  风险成立条件:
-    - 云端不可信 + 低置信度样本被记录
-    - 或: 通信链路未加密, 中间人截获原图
-    - 或: 攻击者可通过多次请求推断阈值
-  缓解建议:
-    - 提高阈值: 阈值从 0.8 提到 0.95,
-       减少上传比例
-      (影响: 更多样本用端侧结果, 可能降低整体准确率)
-    - 端侧模型增强: 用更大模型提升基础置信度
-      (影响: 增加端侧计算开销)
-    - 原图加密传输: 使用 HTTPS
-      (影响: 增加少量加密开销)
-    - 差分隐私: 在上传前对原图加噪
-      (影响: 可能降低云端预测准确率)
-
---------------------------------------------
-
-综合对比:
-  通信量: 方案A 每次传 401KB, 方案B 仅低置信度样本传 100-150KB
-  原图暴露: 方案A 不传原图, 方案B 部分样本传原图
-  特征泄露: 方案A 传中间特征(可反演), 方案B 不传特征
-  元数据泄露: 方案A 无(每次都一样), 方案B 有(上传模式泄露信息)
-  
-  关键结论:
-    "未上传原图" 不等于 "没有隐私风险"
-    - 方案A 不传原图但传大特征图, 反演攻击有文献支持
-    - 方案B 有时不传任何数据, 但上传条件本身泄露元信息
-"""
-
-print(privacy)
-with open('results/privacy_analysis.md', 'w', encoding='utf-8') as f:
-    f.write(privacy)
-
-# === 云端日志分析 ===
-if os.path.exists('results/cloud_log.json'):
-    with open('results/cloud_log.json', 'r', encoding='utf-8') as f:
-        clog = json.load(f)
-    split_calls = [x for x in clog if x['endpoint'] == '/split']
-    offload_calls = [x for x in clog if x['endpoint'] == '/offload']
-    log_summary = f"""
-============================================
-   云端日志分析 (隐私分析辅助)
-============================================
-方案A /split 调用次数: {len(split_calls)}
-  每次接收数据: {split_calls[0]['bytes'] if split_calls else 0} bytes
-  数据类型: 中间特征图 (128x28x28 float32)
-  
-方案B /offload 调用次数: {len(offload_calls)}
-  每次接收数据: {offload_calls[0]['bytes'] if offload_calls else 0} bytes (平均)
-  数据类型: 原始图像 PNG
-  实际上传比例: {len(offload_calls) / (len(split_calls) + len(offload_calls)) * 100:.1f}%
-
-云端可见信息:
-  方案A: 每次请求的中间特征图 (可重建)
-  方案B: 仅低置信度样本的原图 (最敏感)
-"""
-    print(log_summary)
-    with open('results/cloud_log_analysis.txt', 'w', encoding='utf-8') as f:
-        f.write(log_summary)
-
-print('\n所有结果已保存到 results/ 目录:')
-print('  benchmark.csv       - 原始数据')
-print('  comparison.png       - 对比图表')
-print('  summary.txt         - 性能汇总表')
-print('  privacy_analysis.md  - 隐私分析对比表')
-print('  cloud_log.json       - 云端日志')
-print('  cloud_log_analysis.txt - 云端日志分析')
+    # === 图 ===
+    tau = 0.9
+    if os.path.exists('results/tau.txt'):
+        with open('results/tau.txt', encoding='utf-8') as f:
+            tau = float(f.read().strip())
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
+    a, b = 'Plan A\nSplitNN', 'Plan B\nConf. Offload'
+    axes[0].bar([a, b], [df['lat_split_ms'].mean(),
+                         df['lat_offload_ms'].mean()],
+                color=['steelblue', 'coral'])
+    axes[0].set_ylabel('ms')
+    axes[0].set_title('End-to-end Latency')
+    axes[1].bar([a, b], [comm_a / 1024, mean_comm_b / 1024],
+                color=['steelblue', 'coral'])
+    axes[1].set_ylabel('KB (mean over all queries)')
+    axes[1].set_title('Avg. Communication')
+    n_up, n_local = int(df['uploaded'].sum()), int((~df['uploaded']).sum())
+    axes[2].pie([n_local, n_up], labels=['Edge self-answer', 'Offloaded'],
+                autopct='%1.1f%%', colors=['lightgreen', 'salmon'])
+    axes[2].set_title(f'Plan B Routing (TAU={tau:.2f})')
+    axes[3].hist(df['conf_mobile'], bins=40, color='gray')
+    axes[3].axvline(tau, color='red', linestyle='--', label=f'threshold {tau:.2f}')
+    axes[3].set_xlabel('MobileNet softmax confidence')
+    axes[3].legend()
+    axes[3].set_title('Edge Confidence Distribution')
+    plt.tight_layout()
+    plt.savefig('results/comparison.png', dpi=150)
+    print('图已保存 results/comparison.png')

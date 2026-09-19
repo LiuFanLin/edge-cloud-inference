@@ -1,82 +1,121 @@
 # -*- coding: utf-8 -*-
-"""性能测试主脚本：100 样本 x 3 轮 x 2 方案"""
-import torch
-import time
+"""性能测试:
+1) 前 50 张做方案B 阈值校准 (取 MobileNet 置信度 30% 分位数, 截断 [0.5,0.99]),
+   使上传比例可控且可复现;
+2) 后 200 张正式测试, 3 轮, 两方案, 记录时延/通信/置信度/预测.
+输出 results/benchmark.csv
+"""
 import csv
+import io
 import os
+import time
+
 import requests
+import torch
+from PIL import Image as PILImage
+
+import edge_client
 from edge_client import run_split, run_offload
 
 os.makedirs('results', exist_ok=True)
+CALIB, N, ROUNDS, WARMUP = 50, 200, 3, 5
 
-data = torch.load('data/cifar100.pt', weights_only=False)
-samples = data['samples']
-labels = data['labels']
-imagenet_labels = data['imagenet_labels']
 
-# 预热 5 张
-print('预热...')
-for i in range(5):
-    run_split(samples[i])
-    run_offload(samples[i])
+def main():
+    data = torch.load('data/test250.pt', weights_only=False)
+    samples, labels = data['samples'], data['labels']
+    assert len(samples) >= CALIB + N, '样本不足, 请重跑 prepare_data.py'
 
-results = []
-NUM_ROUNDS = 3
+    # 显存峰值统计覆盖全流程 (校准 + 基线 + 双方案)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
-for round_idx in range(NUM_ROUNDS):
-    print(f'\n=== 第 {round_idx + 1} 轮 ===')
-    for i in range(100):
-        img = samples[i]
-        true_in = imagenet_labels[i]
-        true_cifar = labels[i]
+    # --- 阈值校准 ---
+    confs = []
+    for i in range(CALIB):
+        c, _ = edge_client.mobile_conf(samples[i])
+        confs.append(c)
+    confs.sort()
+    tau = confs[int(0.30 * len(confs))]  # 30% 分位 -> 目标上传比例约 30%
+    tau = min(max(tau, 0.50), 0.99)
+    edge_client.TAU = tau
+    with open('results/tau.txt', 'w', encoding='utf-8') as f:
+        f.write(f'{tau:.4f}')
+    print(f'校准完成: 阈值 TAU = {tau:.4f} (目标上传比例约 30%)')
 
-        # 方案A
-        t0 = time.perf_counter()
-        pred_a, comm_a, e_a, c_a = run_split(img)
-        t1 = time.perf_counter()
-        latency_a = (t1 - t0) * 1000
+    # --- 预热 (校准集样本, 不计入正式数据) ---
+    print('预热...')
+    for i in range(WARMUP):
+        run_split(samples[i])
+        run_offload(samples[i])
+    # 校准样本可能全部高置信而未触发上传, 显式预热一次云端 /offload 路由,
+    # 避免首个真实上传样本承担模型 warm-up 开销.
+    _buf = io.BytesIO()
+    PILImage.new('RGB', (224, 224)).save(_buf, format='PNG')
+    requests.post(f'{edge_client.CLOUD}/offload',
+                  data=_buf.getvalue(), timeout=60)
+    # 预热请求也写入了云端日志, 清空以保证正式统计只含测试数据
+    if os.path.exists('results/cloud_log.jsonl'):
+        os.remove('results/cloud_log.jsonl')
 
-        # 方案B
-        t0 = time.perf_counter()
-        pred_b, comm_b, e_b, c_b, uploaded = run_offload(img)
-        t1 = time.perf_counter()
-        latency_b = (t1 - t0) * 1000
+    # --- 纯云模型能力基线: 完整 ResNet50 对全部正式样本各推理一次 ---
+    # 涉及不同模型时, 区分模型本身的能力差异与协同策略的影响:
+    # 端侧基线(MobileNetV3) / 模型上界(ResNet50) / 方案B 混合, 三者对照分解.
+    # 同时用 pred_rn50 验证方案A 切分拼接与完整前向的数值等价性.
+    print('完整 ResNet50 基线推理...')
+    rn50_preds, rn50_times = [], []
+    with torch.no_grad():
+        for j in range(N):
+            x = samples[CALIB + j].unsqueeze(0).to(edge_client.DEVICE)
+            t0 = time.perf_counter()
+            out = edge_client._resnet(x)
+            if edge_client.DEVICE == 'cuda':
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            rn50_preds.append(int(out.argmax(dim=1).item()))
+            rn50_times.append((t1 - t0) * 1000)
+    print(f'基线完成, 平均时延 {sum(rn50_times)/N:.2f} ms')
 
-        results.append({
-            'round': round_idx,
-            'sample_id': i,
-            'true_cifar': true_cifar,
-            'true_imagenet': true_in,
-            'pred_split': pred_a,
-            'latency_split_ms': round(latency_a, 2),
-            'edge_split_ms': round(e_a, 2),
-            'cloud_split_ms': round(c_a, 2),
-            'comm_split_bytes': comm_a,
-            'pred_offload': pred_b,
-            'latency_offload_ms': round(latency_b, 2),
-            'edge_offload_ms': round(e_b, 2),
-            'cloud_offload_ms': round(c_b, 2),
-            'comm_offload_bytes': comm_b,
-            'uploaded': uploaded,
-        })
+    rows = []
+    for r in range(ROUNDS):
+        print(f'=== 第 {r + 1}/{ROUNDS} 轮 ===')
+        for j in range(N):
+            i = CALIB + j
+            img, y = samples[i], labels[i]
+            ps, cs, es, vs = run_split(img)
+            pf, co, eo, vo, conf, up, pe = run_offload(img)
+            rows.append({
+                'round': r, 'sample_id': i, 'true_label': y,
+                'pred_edge_mobile': pe, 'conf_mobile': round(conf, 4),
+                'uploaded': up,
+                'pred_split': ps, 'lat_split_ms': round(es + vs, 2),
+                'edge_split_ms': round(es, 2),
+                'cloud_split_ms': round(vs, 2),
+                'comm_split_bytes': cs,
+                'pred_offload': pf, 'lat_offload_ms': round(eo + vo, 2),
+                'edge_offload_ms': round(eo, 2),
+                'cloud_offload_ms': round(vo, 2),
+                'comm_offload_bytes': co,
+                'pred_rn50': rn50_preds[j],
+                'rn50_ms': round(rn50_times[j], 2),
+            })
+            if (j + 1) % 50 == 0:
+                print(f'  {j + 1}/{N}')
 
-        if (i + 1) % 20 == 0:
-            print(f'  已完成 {i + 1}/100')
+    with open('results/benchmark.csv', 'w', newline='',
+              encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader()
+        w.writerows(rows)
+    # 端侧进程显存峰值 (MobileNet + ResNet50-front + 完整 ResNet50 全加载时的最坏情况)
+    peak_mb = 0.0
+    if torch.cuda.is_available():
+        peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+    with open('results/edge_peak_mem.txt', 'w', encoding='utf-8') as f:
+        f.write(f'{peak_mb:.1f}')
+    print(f'完成 {len(rows)} 条 -> results/benchmark.csv '
+          f'(端侧 GPU 显存峰值 {peak_mb:.1f} MB)')
 
-# 获取云端日志
-try:
-    cloud_log = requests.get('http://localhost:5000/log', timeout=5).json()
-    import json
-    with open('results/cloud_log.json', 'w', encoding='utf-8') as f:
-        json.dump(cloud_log, f, ensure_ascii=False, indent=2)
-    print(f'云端日志已保存 ({len(cloud_log)} 条记录)')
-except Exception as e:
-    print(f'获取云端日志失败: {e}')
 
-# 保存 CSV
-with open('results/benchmark.csv', 'w', newline='', encoding='utf-8') as f:
-    writer = csv.DictWriter(f, fieldnames=results[0].keys())
-    writer.writeheader()
-    writer.writerows(results)
-
-print(f'\n结果已保存到 results/benchmark.csv ({len(results)} 条记录)')
+if __name__ == '__main__':
+    main()

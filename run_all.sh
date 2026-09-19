@@ -1,54 +1,36 @@
 #!/bin/bash
-# 一键运行全部流程
 set -e
-
-echo "============================================"
-echo "  端云协同推理性能对比 - 一键运行"
-echo "============================================"
-
-# 步骤1: 准备数据
-echo ""
-echo "[1/5] 准备测试数据..."
+echo "[1/6] 准备数据 (imagenette2-320, 250 张)..."
 python prepare_data.py
-
-# 步骤2: 启动云端服务
-echo ""
-echo "[2/5] 启动云端服务..."
+echo "[2/6] 模型规模评估 (参数量/FLOPs/切分点分解)..."
+python models.py
+mkdir -p results
+rm -f results/cloud_log.jsonl
+echo "[3/6] 启动云端服务 (首次运行需下载 ResNet50 权重约 100MB)..."
 python cloud_server.py &
 CLOUD_PID=$!
-echo "云端服务 PID: $CLOUD_PID"
-
-# 等待云端启动
-echo "等待云端服务启动..."
-sleep 10
-
-# 步骤3: 测试连接
-echo ""
-echo "[3/5] 测试端云连接..."
+trap 'kill $CLOUD_PID 2>/dev/null' EXIT
+echo "云端 PID: $CLOUD_PID, 轮询等待就绪 (最多 6 分钟)..."
+for i in $(seq 1 180); do
+    if curl -s -o /dev/null http://localhost:5000/; then
+        echo "云端已就绪"
+        break
+    fi
+    if ! kill -0 $CLOUD_PID 2>/dev/null; then
+        echo "错误: 云端进程异常退出"
+        exit 1
+    fi
+    if [ "$i" = "180" ]; then
+        echo "错误: 等待云端超时"
+        exit 1
+    fi
+    sleep 2
+done
+echo "[4/6] 连接测试 (首次运行会再下载端侧模型权重)..."
 python edge_client.py
-
-# 步骤4: 性能测试
-echo ""
-echo "[4/5] 运行性能测试 (100样本 x 3轮 x 2方案)..."
+echo "[5/6] 性能测试 (阈值校准 + 200 样本 x 3 轮)..."
 python run_benchmark.py
-
-# 步骤5: 分析结果
-echo ""
-echo "[5/5] 分析结果 + 生成图表..."
+kill $CLOUD_PID 2>/dev/null || true
+echo "[6/6] 分析结果..."
 python analyze.py
-
-# 关闭云端
-echo ""
-echo "关闭云端服务..."
-kill $CLOUD_PID
-
-echo ""
-echo "============================================"
-echo "  全部完成! 结果在 results/ 目录"
-echo "============================================"
-echo "  benchmark.csv       - 原始数据"
-echo "  comparison.png       - 对比图表"
-echo "  summary.txt         - 性能汇总表"
-echo "  privacy_analysis.md  - 隐私分析对比表"
-echo "  cloud_log.json       - 云端日志"
-echo "============================================"
+echo "全部完成: results/summary.txt / comparison.png / model_profile.txt / benchmark.csv"

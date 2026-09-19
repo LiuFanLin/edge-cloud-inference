@@ -1,75 +1,85 @@
 # -*- coding: utf-8 -*-
-"""云端服务：Flask 提供 split 和 offload 两个接口"""
+"""云端服务 (Flask):
+/split   方案A: 接收中间特征图, 跑 ResNet50 后半 (layer4 + fc)
+/offload 方案B: 接收原图 PNG, 跑完整 ResNet50 (端云模型分级, 云侧为强模型)
+每请求记录 jsonl 日志 (路由/字节数/推理耗时/预测).
+"""
+import io
+import json
+import os
+import time
+from datetime import datetime
+
 import numpy as np
 import torch
-import io
 from flask import Flask, request
-from models import get_resnet18, split_resnet18
 from PIL import Image
 from torchvision import transforms
 
+from models import get_resnet50, split_resnet
+
 app = Flask(__name__)
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+CUT = 'layer3'  # 主切分点: layer3 之后, 特征 1024x14x14
 
-print('加载云端模型...')
-resnet = get_resnet18()
-front, back, fc = split_resnet18(resnet)
-resnet.eval()
-back.eval()
-fc.eval()
+os.makedirs('results', exist_ok=True)
+LOG = 'results/cloud_log.jsonl'
 
-preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),
+print(f'加载云端模型 (device={DEVICE}, 切分点={CUT})...')
+_resnet = get_resnet50().to(DEVICE).eval()
+_front, _back, _fc = split_resnet(_resnet, CUT)
+
+# 上传的 PNG 已是端侧 CenterCrop 224 的结果, 云端只做 ToTensor+Normalize,
+# 不得再 Resize/Crop —— 否则等效于对输入二次裁剪, 改变样本内容.
+TF = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# 记录云端接收到的数据（用于隐私分析）
-cloud_log = []
+
+def log(entry: dict):
+    entry['time'] = datetime.now().isoformat(timespec='milliseconds')
+    with open(LOG, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
 
 @app.route('/split', methods=['POST'])
 def split_infer():
-    """方案A: 接收中间特征图 (1x128x28x28 float32)"""
+    """方案A: 接收中间特征图, shape 由 query 参数 c/h/w 传入."""
+    t0 = time.perf_counter()
     data = request.get_data()
-    cloud_log.append({
-        'endpoint': '/split',
-        'bytes': len(data),
-        'content_type': 'feature_map_128x28x28',
-    })
-    feat = np.frombuffer(data, dtype=np.float32).reshape(1, 128, 28, 28)
+    c = int(request.args.get('c', '1024'))
+    h = int(request.args.get('h', '14'))
+    w = int(request.args.get('w', '14'))
+    feat = np.frombuffer(data, dtype=np.float32).reshape(1, c, h, w).copy()
     with torch.no_grad():
-        x = torch.from_numpy(feat.copy())
-        x = back(x)                                  # 1x512x7x7
-        x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))  # 1x512x1x1
-        x = torch.flatten(x, 1)                      # 1x512
-        out = fc(x)
-    pred = out.argmax(1).item()
+        x = torch.from_numpy(feat).to(DEVICE)
+        x = _back(x)
+        x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
+        x = torch.flatten(x, 1)
+        out = _fc(x)
+    pred = int(out.argmax(1).item())
+    infer_ms = (time.perf_counter() - t0) * 1000
+    log({'route': 'split', 'bytes': len(data),
+         'infer_ms': round(infer_ms, 2), 'pred': pred})
     return str(pred)
 
 
 @app.route('/offload', methods=['POST'])
 def offload_infer():
-    """方案B: 接收原图 PNG bytes"""
-    img_bytes = request.get_data()
-    cloud_log.append({
-        'endpoint': '/offload',
-        'bytes': len(img_bytes),
-        'content_type': 'raw_image_png',
-    })
-    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-    tensor = preprocess(img).unsqueeze(0)
+    """方案B: 接收原图 PNG, 用完整 ResNet50 重判."""
+    t0 = time.perf_counter()
+    data = request.get_data()
+    img = Image.open(io.BytesIO(data)).convert('RGB')
+    tensor = TF(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        out = resnet(tensor)
-    pred = out.argmax(1).item()
+        out = _resnet(tensor)
+    pred = int(out.argmax(1).item())
+    infer_ms = (time.perf_counter() - t0) * 1000
+    log({'route': 'offload', 'bytes': len(data),
+         'infer_ms': round(infer_ms, 2), 'pred': pred})
     return str(pred)
-
-
-@app.route('/log', methods=['GET'])
-def get_log():
-    """返回云端日志（用于隐私分析）"""
-    import json
-    return json.dumps(cloud_log, ensure_ascii=False)
 
 
 if __name__ == '__main__':
